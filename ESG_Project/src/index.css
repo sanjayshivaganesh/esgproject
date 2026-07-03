@@ -1,0 +1,76 @@
+@import "tailwindcss";
+
+body {
+  margin: 0;
+  background: #fbf8f3;
+  color: #101010;
+  font-family:
+    system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+@theme {
+  --color-background: #fbf8f3;
+  --color-ink: #101010;
+  --color-muted: #6f6f6f;
+  --color-line: #eae6e1;
+  --color-accent: #1d352f;
+  --color-cardBg: #fcfaf7;
+  --tracking-featured-eyebrow: .16em;
+}
+
+@layer components {
+  .container-qml {
+    max-width: 80rem;
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 1.5rem;
+    padding-right: 1.5rem;
+  }
+
+  @media (min-width: 1024px) {
+    .container-qml {
+      padding-left: 3.5rem;
+      padding-right: 3.5rem;
+    }
+  }
+
+  .card-qml {
+    background-color: #fcfaf7;
+    border: 1px solid #eae6e1;
+    border-radius: 0.5rem;
+    padding: 2rem;
+    transition:
+      border-color 0.2s ease-in-out,
+      transform 0.2s ease-in-out,
+      opacity 0.2s ease-in-out;
+  }
+
+  .card-qml:hover {
+    border-color: #c0bbb4;
+  }
+
+  @media (max-width: 640px) {
+    .card-qml {
+      padding: 1.25rem;
+    }
+  }
+
+  .qml-grid {
+    background-size: 40px 40px;
+    background-image:
+      linear-gradient(to right, rgba(234, 230, 225, 0.4) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(234, 230, 225, 0.4) 1px, transparent 1px);
+  }
+
+  .page-section {
+    transition: opacity 0.15s ease-in-out;
+  }
+}
