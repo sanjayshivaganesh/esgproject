@@ -60,6 +60,38 @@ CONFIG = {
     "CONFIDENCE_QUANTIFIED_MULTIPLIER": 8,
     "SUPPORT_RATIO_STRONG_THRESHOLD": 1.0,
     "SUPPORT_RATIO_PARTIAL_THRESHOLD": 0.5,
+    # New: Dynamic thresholding parameters
+    "UNKNOWN_TOPIC_SEMANTIC_THRESHOLD": 0.62,  # Lowered from 0.68
+    "CONFIDENCE_THRESHOLD_LOW": 0.6,
+    "CONFIDENCE_THRESHOLD_HIGH": 0.8,
+    "SEMANTIC_THRESHOLD_LOW_CONFIDENCE": 0.60,
+    "SEMANTIC_THRESHOLD_HIGH_CONFIDENCE": 0.50,
+    "OVERALL_THRESHOLD_LOW_CONFIDENCE": 0.50,
+    "OVERALL_THRESHOLD_HIGH_CONFIDENCE": 0.40,
+    # Generic phrase patterns for false positive reduction
+    "GENERIC_PHRASES": [
+        r"we are committed to",
+        r"we commit to",
+        r"our commitment to",
+        r"sustainability is important",
+        r"we believe in",
+        r"we strive to",
+        r"we aim to",
+        r"we will continue to",
+        r"we recognize the importance of",
+        r"we are dedicated to",
+        r"we prioritize",
+        r"we focus on",
+        r"we work towards",
+        r"we are working to",
+        r"we seek to",
+        r"we endeavor to",
+        r"we pledge to",
+        r"we promise to",
+        r"we intend to",
+        r"we plan to",
+        r"we expect to",
+    ],
 }
 
 MAX_HITS_PER_CATEGORY = CONFIG["MAX_HITS_PER_CATEGORY"]
@@ -82,7 +114,14 @@ SENTENCE_OBJECT_DEDUPLICATION_THRESHOLD = CONFIG[
     "SENTENCE_OBJECT_DEDUPLICATION_THRESHOLD"
 ]
 EMBEDDING_DUPLICATE_THRESHOLD = CONFIG["DUPLICATE_THRESHOLD"]
-TARGET_OUTCOME_SIMILARITY_THRESHOLD = CONFIG["SIMILARITY_THRESHOLD"]
+UNKNOWN_TOPIC_SEMANTIC_THRESHOLD = CONFIG["UNKNOWN_TOPIC_SEMANTIC_THRESHOLD"]
+CONFIDENCE_THRESHOLD_LOW = CONFIG["CONFIDENCE_THRESHOLD_LOW"]
+CONFIDENCE_THRESHOLD_HIGH = CONFIG["CONFIDENCE_THRESHOLD_HIGH"]
+SEMANTIC_THRESHOLD_LOW_CONFIDENCE = CONFIG["SEMANTIC_THRESHOLD_LOW_CONFIDENCE"]
+SEMANTIC_THRESHOLD_HIGH_CONFIDENCE = CONFIG["SEMANTIC_THRESHOLD_HIGH_CONFIDENCE"]
+OVERALL_THRESHOLD_LOW_CONFIDENCE = CONFIG["OVERALL_THRESHOLD_LOW_CONFIDENCE"]
+OVERALL_THRESHOLD_HIGH_CONFIDENCE = CONFIG["OVERALL_THRESHOLD_HIGH_CONFIDENCE"]
+GENERIC_PHRASES = CONFIG["GENERIC_PHRASES"]
 OUTCOME_ENTITY_WEIGHT = CONFIG["OUTCOME_ENTITY_MATCH_WEIGHT"]
 OUTCOME_SUBENTITY_WEIGHT = CONFIG["OUTCOME_SUBENTITY_MATCH_WEIGHT"]
 MIN_TARGETS_FOR_KMEANS = CONFIG["MIN_TARGETS_FOR_KMEANS"]
@@ -755,6 +794,25 @@ def link_targets_to_outcomes(
             "their",
         }
 
+        # Compile generic phrase patterns for efficient matching
+        GENERIC_PHRASE_PATTERN = re.compile(
+            "|".join(GENERIC_PHRASES), re.IGNORECASE
+        )
+
+        def _is_generic_phrase(text: str) -> bool:
+            """Check if text contains generic sustainability boilerplate."""
+            return bool(GENERIC_PHRASE_PATTERN.search(text.lower()))
+
+        def _get_dynamic_threshold(base_threshold: float, confidence: float) -> float:
+            """Adjust threshold based on classification confidence."""
+            if confidence >= CONFIDENCE_THRESHOLD_HIGH:
+                # High confidence: lower threshold (easier to match)
+                return base_threshold - 0.05
+            elif confidence <= CONFIDENCE_THRESHOLD_LOW:
+                # Low confidence: higher threshold (harder to match)
+                return base_threshold + 0.05
+            return base_threshold
+
         def _lexical_overlap(text_a: str, text_b: str) -> float:
             tokens_a = {
                 token
@@ -807,6 +865,18 @@ def link_targets_to_outcomes(
             target_entity = target_grounding.get("entity")
             target_topic = TOPIC_MAP.get(target_entity, "unknown")
             target_text = target.get("text", "")
+            target_confidence = float(target.get("confidence", 0.0) or 0.0)
+
+            # Skip generic target phrases to reduce false positives
+            if _is_generic_phrase(target_text):
+                debug_log(
+                    f"[MATCH SKIP] Generic target phrase detected | target: {target_text[:80]}"
+                )
+                continue
+
+            # Get dynamic thresholds based on confidence
+            dynamic_semantic_threshold = _get_dynamic_threshold(0.55, target_confidence)
+            dynamic_overall_threshold = _get_dynamic_threshold(0.45, target_confidence)
 
             candidates = []
             for outcome in outcomes:
@@ -815,23 +885,24 @@ def link_targets_to_outcomes(
                     continue
 
                 semantic_sim = cosine_similarity(target_embedding, outcome_embedding)
-                if semantic_sim < 0.55:
+                if semantic_sim < dynamic_semantic_threshold:
                     debug_log(
-                        f"[MATCH REJECT] semantic_sim={semantic_sim:.3f} < 0.55 | target: {target_text[:80]} | outcome: {outcome.get('text','')[:80]}"
+                        f"[MATCH REJECT] semantic_sim={semantic_sim:.3f} < {dynamic_semantic_threshold:.3f} | target: {target_text[:80]} | outcome: {outcome.get('text','')[:80]}"
                     )
                     continue
 
                 outcome_grounding = outcome.get("grounding", {})
                 outcome_entity = outcome_grounding.get("entity")
                 outcome_topic = TOPIC_MAP.get(outcome_entity, "unknown")
+                outcome_confidence = float(outcome.get("confidence", 0.0) or 0.0)
 
                 if target_topic == "unknown" and outcome_topic == "unknown":
                     # Neither sentence has a resolvable ESG entity.
                     # Require stronger semantic similarity to compensate.
                     topic_score = 0.3
-                    if semantic_sim < 0.68:
+                    if semantic_sim < UNKNOWN_TOPIC_SEMANTIC_THRESHOLD:
                         debug_log(
-                            f"[MATCH REJECT] both unknown topic, semantic_sim={semantic_sim:.3f} < 0.68 | target: {target_text[:80]} | outcome: {outcome.get('text','')[:80]}"
+                            f"[MATCH REJECT] both unknown topic, semantic_sim={semantic_sim:.3f} < {UNKNOWN_TOPIC_SEMANTIC_THRESHOLD} | target: {target_text[:80]} | outcome: {outcome.get('text','')[:80]}"
                         )
                         continue
                 elif target_topic == outcome_topic:
@@ -845,16 +916,23 @@ def link_targets_to_outcomes(
 
                 lexical_score = _lexical_overlap(target_text, outcome.get("text", ""))
                 metric_score = _metric_overlap(target_grounding, outcome_grounding)
+                
+                # Incorporate confidence into overall match score
+                # Higher confidence pairs get a boost
+                avg_confidence = (target_confidence + outcome_confidence) / 2.0
+                confidence_boost = avg_confidence * 0.05  # Up to 0.05 boost
+                
                 overall_match = (
                     0.45 * semantic_sim
                     + 0.25 * topic_score
                     + 0.20 * lexical_score
                     + 0.10 * metric_score
+                    + confidence_boost
                 )
 
-                if overall_match < 0.45:
+                if overall_match < dynamic_overall_threshold:
                     debug_log(
-                        f"[MATCH REJECT] overall_match={overall_match:.3f} < 0.45 | target: {target_text[:80]} | outcome: {outcome.get('text','')[:80]}"
+                        f"[MATCH REJECT] overall_match={overall_match:.3f} < {dynamic_overall_threshold:.3f} | target: {target_text[:80]} | outcome: {outcome.get('text','')[:80]}"
                     )
                     continue
 
@@ -866,6 +944,7 @@ def link_targets_to_outcomes(
                         "lexical_score": lexical_score,
                         "metric_score": metric_score,
                         "overall_match": overall_match,
+                        "confidence_boost": confidence_boost,
                     }
                 )
 
