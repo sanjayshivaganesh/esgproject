@@ -212,17 +212,17 @@ def normalize_embedding(embedding: Optional[np.ndarray]) -> Optional[np.ndarray]
     if embedding is None:
         return None
     try:
-        array = np.asarray(embedding, dtype=float)
+        array = np.asarray(embedding, dtype=np.float32)
         if array.ndim != 1:
             array = array.reshape(-1)
         norm = np.linalg.norm(array)
         if not np.isfinite(norm):
-            return np.zeros(CONFIG["EMBEDDING_DIM"], dtype=float)
+            return np.zeros(CONFIG["EMBEDDING_DIM"], dtype=np.float32)
         if norm == 0.0:
-            return np.zeros_like(array, dtype=float)
-        return array / norm
+            return np.zeros_like(array, dtype=np.float32)
+        return (array / norm).astype(np.float32)
     except Exception:
-        return np.zeros(CONFIG["EMBEDDING_DIM"], dtype=float)
+        return np.zeros(CONFIG["EMBEDDING_DIM"], dtype=np.float32)
 
 
 def cosine_similarity(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
@@ -236,7 +236,7 @@ def cosine_similarity(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float
 
 
 def zero_embedding_matrix(size: int) -> np.ndarray:
-    return np.zeros((size, CONFIG["EMBEDDING_DIM"]), dtype=float)
+    return np.zeros((size, CONFIG["EMBEDDING_DIM"]), dtype=np.float32)
 
 
 def load_ml_model() -> Tuple[Optional[Any], List[str]]:
@@ -971,7 +971,7 @@ def cluster_targets(sentence_objects: List[Dict[str, Any]]) -> List[Dict[str, An
 # ------------------------------
 def embed_sentences(sentences: Sequence[str]) -> np.ndarray:
     if not sentences:
-        return np.array([])
+        return np.empty((0, CONFIG["EMBEDDING_DIM"]), dtype=np.float32)
 
     embedding_model = get_embedding_model()
     if embedding_model is None:
@@ -980,12 +980,24 @@ def embed_sentences(sentences: Sequence[str]) -> np.ndarray:
 
     try:
         raw_embeddings = embedding_model.encode(
-            list(sentences), normalize_embeddings=True
+            list(sentences), normalize_embeddings=True, convert_to_numpy=True
         )
-        normalized_embeddings = [
-            normalize_embedding(embedding) for embedding in raw_embeddings
-        ]
-        return np.array(normalized_embeddings, dtype=float)
+        embeddings = np.asarray(raw_embeddings, dtype=np.float32)
+        if embeddings.ndim == 1:
+            embeddings = embeddings.reshape(1, -1)
+        return embeddings
+    except TypeError:
+        try:
+            raw_embeddings = embedding_model.encode(
+                list(sentences), normalize_embeddings=True
+            )
+            embeddings = np.asarray(raw_embeddings, dtype=np.float32)
+            if embeddings.ndim == 1:
+                embeddings = embeddings.reshape(1, -1)
+            return embeddings
+        except Exception as error:
+            print(f"Error generating embeddings: {error}")
+            return zero_embedding_matrix(len(sentences))
     except Exception as error:
         print(f"Error generating embeddings: {error}")
         return zero_embedding_matrix(len(sentences))
@@ -1047,36 +1059,39 @@ def deduplicate_sentences_with_embeddings(
     threshold: float = EMBEDDING_DUPLICATE_THRESHOLD,
 ) -> Tuple[List[str], np.ndarray]:
     if not sentences:
-        return [], np.array([])
+        return [], np.empty((0, CONFIG["EMBEDDING_DIM"]), dtype=np.float32)
 
     try:
-        embeddings = embed_sentences(sentences)
-        if len(embeddings) == 0:
-            return list(sentences), zero_embedding_matrix(len(sentences))
+        sentences_list = list(sentences)
+        if len(sentences_list) != len(set(sentences_list)):
+            seen: Dict[str, bool] = {}
+            unique_sentences: List[str] = []
+            for sentence in sentences_list:
+                if sentence not in seen:
+                    seen[sentence] = True
+                    unique_sentences.append(sentence)
+            sentences_list = unique_sentences
 
-        # If the embedding model failed and produced only zero vectors, keep all sentences
-        # to avoid accidental over-deduplication on degenerate embeddings.
-        if all(
-            np.linalg.norm(np.asarray(embedding, dtype=float)) == 0.0
-            for embedding in embeddings
-        ):
-            return list(sentences), embeddings
+        embeddings = embed_sentences(sentences_list)
+        if embeddings.size == 0:
+            return sentences_list, zero_embedding_matrix(len(sentences_list))
+
+        norms = np.linalg.norm(embeddings, axis=1)
+        if np.all(norms == 0.0):
+            return sentences_list, embeddings
 
         keep_indices: List[int] = []
-        for index, embedding in enumerate(embeddings):
-            is_duplicate = False
-            for kept_index in keep_indices:
-                similarity = cosine_similarity(embedding, embeddings[kept_index])
-                if similarity > threshold:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                keep_indices.append(index)
+        for index in range(len(embeddings)):
+            embedding = embeddings[index]
+            if keep_indices:
+                kept_embeddings = embeddings[np.array(keep_indices, dtype=np.int64)]
+                similarities = np.dot(kept_embeddings, embedding)
+                if np.any(similarities > threshold):
+                    continue
+            keep_indices.append(index)
 
-        kept_sentences = [sentences[index] for index in keep_indices]
-        kept_embeddings = np.array(
-            [embeddings[index] for index in keep_indices], dtype=float
-        )
+        kept_sentences = [sentences_list[index] for index in keep_indices]
+        kept_embeddings = embeddings[np.array(keep_indices, dtype=np.int64)]
         return kept_sentences, kept_embeddings
     except Exception as error:
         print(f"Error deduplicating sentences with embeddings: {error}")
