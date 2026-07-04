@@ -1,8 +1,17 @@
+import gc
 import math
+import os
 import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+try:
+    import psutil
+    DEBUG_MEMORY = True
+except Exception:
+    psutil = None
+    DEBUG_MEMORY = False
 
 try:
     import joblib
@@ -12,6 +21,15 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 DEBUG = True
+
+# Memory profiling
+def log_memory(stage: str) -> None:
+    """Log current memory usage at a specific stage."""
+    if DEBUG_MEMORY and psutil:
+        process = psutil.Process(os.getpid())
+        mem_mb = process.memory_info().rss / 1024 / 1024
+        print(f"[MEMORY] {stage}: {mem_mb:.1f} MB")
+
 CONFIG = {
     "MAX_HITS_PER_CATEGORY": 3,
     "RANDOM_STATE": 42,
@@ -1012,6 +1030,7 @@ def cluster_targets(sentence_objects: List[Dict[str, Any]]) -> List[Dict[str, An
         if len(valid_targets) < MIN_TARGETS_FOR_KMEANS:
             return [{"targets": [target.get("text", "") for target in targets]}]
 
+        # Construct embedding matrix immediately before fit_predict
         target_embeddings = np.array(
             [normalize_embedding(target.get("embedding")) for target in valid_targets]
         )
@@ -1020,6 +1039,10 @@ def cluster_targets(sentence_objects: List[Dict[str, Any]]) -> List[Dict[str, An
             n_clusters=n_clusters, random_state=RANDOM_STATE, n_init=KMEANS_N_INIT
         )
         cluster_labels = kmeans.fit_predict(target_embeddings)
+        
+        # Delete embedding matrix immediately after use
+        del target_embeddings
+        gc.collect()
 
         clusters: Dict[int, List[str]] = {}
         for index, cluster_id in enumerate(cluster_labels):
@@ -1141,7 +1164,10 @@ def deduplicate_sentences_with_embeddings(
         return [], np.empty((0, CONFIG["EMBEDDING_DIM"]), dtype=np.float32)
 
     try:
-        sentences_list = list(sentences)
+        # Avoid unnecessary copy if already a list
+        sentences_list = sentences if isinstance(sentences, list) else list(sentences)
+        
+        # Remove exact duplicates without creating intermediate structures
         if len(sentences_list) != len(set(sentences_list)):
             seen: Dict[str, bool] = {}
             unique_sentences: List[str] = []
@@ -1160,17 +1186,20 @@ def deduplicate_sentences_with_embeddings(
             return sentences_list, embeddings
 
         keep_indices: List[int] = []
+        # Optimize: avoid creating new arrays in each iteration
         for index in range(len(embeddings)):
             embedding = embeddings[index]
             if keep_indices:
-                kept_embeddings = embeddings[np.array(keep_indices, dtype=np.int64)]
+                # Use slicing instead of creating new array
+                kept_embeddings = embeddings[keep_indices]
                 similarities = np.dot(kept_embeddings, embedding)
                 if np.any(similarities > threshold):
                     continue
             keep_indices.append(index)
 
+        # Create final arrays only once
         kept_sentences = [sentences_list[index] for index in keep_indices]
-        kept_embeddings = embeddings[np.array(keep_indices, dtype=np.int64)]
+        kept_embeddings = embeddings[keep_indices]
         return kept_sentences, kept_embeddings
     except Exception as error:
         print(f"Error deduplicating sentences with embeddings: {error}")
@@ -3033,6 +3062,8 @@ def default_analysis_output():
 def analyze_text(text: str, ml_predictions: Optional[dict] = None):
     _ = ml_predictions
 
+    log_memory("Document received")
+
     default_output = default_analysis_output()
     stage_timings: Dict[str, float] = {}
 
@@ -3042,13 +3073,16 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
         stage_timings["build_sentence_objects"] = round(
             time.perf_counter() - stage_start, 4
         )
+        log_memory("After sentence object construction")
 
         stage_start = time.perf_counter()
         sentence_objs = link_targets_to_outcomes(sentence_objs)
         stage_timings["link_targets_to_outcomes"] = round(
             time.perf_counter() - stage_start, 4
         )
+        log_memory("After linking")
 
+        # Compute sentence classes from objects (lightweight)
         sentence_classes = sentence_classes_from_objects(sentence_objs)
 
         stage_start = time.perf_counter()
@@ -3056,6 +3090,7 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
         stage_timings["compute_cross_sentence_consistency"] = round(
             time.perf_counter() - stage_start, 4
         )
+        log_memory("After consistency computation")
 
         stage_start = time.perf_counter()
         claim = (
@@ -3078,6 +3113,7 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
         stage_timings["compute_outcome_evidence"] = round(
             time.perf_counter() - stage_start, 4
         )
+        log_memory("After outcome evidence")
 
         stage_start = time.perf_counter()
         transparency = (
@@ -3086,6 +3122,7 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
         stage_timings["compute_transparency_signals"] = round(
             time.perf_counter() - stage_start, 4
         )
+        log_memory("After transparency")
 
         stage_start = time.perf_counter()
         context = extract_context_signals(text) or {
@@ -3095,6 +3132,7 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
         stage_timings["extract_context_signals"] = round(
             time.perf_counter() - stage_start, 4
         )
+        log_memory("After context extraction")
 
         deduplicated_kpis = deduplicate_grounded_kpis(outcome.get("grounded_kpis", []))
 
@@ -3151,17 +3189,18 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
             float(consistency.get("consistency_score", 50.0) or 50.0),
         )
 
-        claim_count = sum(1 for item in sentence_classes if item["label"] == "CLAIM")
-        real_outcome_count = sum(
-            1 for item in sentence_classes if item["label"] == "OUTCOME"
-        )
-        target_count = sum(1 for item in sentence_classes if item["label"] == "TARGET")
-        transparency_count = sum(
-            1 for item in sentence_classes if item["label"] == "TRANSPARENCY"
-        )
-        neutral_count = sum(
-            1 for item in sentence_classes if item["label"] == "NEUTRAL"
-        )
+        # Compute label counts once (avoid repeated iterations)
+        label_counts = {"CLAIM": 0, "OUTCOME": 0, "TARGET": 0, "TRANSPARENCY": 0, "NEUTRAL": 0}
+        for item in sentence_classes:
+            label = item.get("label", "NEUTRAL")
+            if label in label_counts:
+                label_counts[label] += 1
+        
+        claim_count = label_counts["CLAIM"]
+        real_outcome_count = label_counts["OUTCOME"]
+        target_count = label_counts["TARGET"]
+        transparency_count = label_counts["TRANSPARENCY"]
+        neutral_count = label_counts["NEUTRAL"]
 
         confidence_distribution = {}
         for obj in sentence_objs:
@@ -3183,6 +3222,12 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
                 )
 
         target_clusters = cluster_targets(sentence_objs)
+        log_memory("After clustering")
+
+        # Free embeddings from sentence objects after clustering (no longer needed)
+        for obj in sentence_objs:
+            obj.pop("embedding", None)
+        log_memory("After freeing embeddings")
 
         total_grounded = sum(
             1 for obj in sentence_objs if obj.get("grounding", {}).get("entity")
@@ -3204,6 +3249,7 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
             else 0.0,
         }
 
+        # Compute target-related metrics once (avoid repeated filtering)
         target_objects = [obj for obj in sentence_objs if obj.get("label") == "TARGET"]
         linked_target_count = sum(
             1 for obj in target_objects if obj.get("linked_outcomes")
@@ -3211,6 +3257,8 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
         linked_outcome_count = sum(
             len(obj.get("linked_outcomes", [])) for obj in target_objects
         )
+        
+        # Compute similarity and strength values using generator expressions
         linked_similarities = [
             float(obj.get("best_semantic_similarity", 0.0) or 0.0)
             for obj in target_objects
@@ -3260,8 +3308,9 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
             "claim_pressure": claim_pressure,
         }
         drivers = generate_drivers(claim, outcome, transparency, metrics)
+        log_memory("Before response serialization")
 
-        return {
+        response = {
             "claim_pressure": claim_pressure,
             "cross_sentence_consistency": consistency,
             "claim": claim,
@@ -3386,6 +3435,15 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
                 ),
             },
         }
+        log_memory("After response construction")
+        
+        # Free temporary variables
+        del sentence_objs
+        del sentence_classes
+        gc.collect()
+        log_memory("After cleanup")
+        
+        return response
     except Exception as error:
         print(f"Error analyzing text: {error}")
         return default_output
