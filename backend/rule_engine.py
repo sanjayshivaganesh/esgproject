@@ -6,9 +6,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+# Memory profiling - controlled by environment variable
 try:
     import psutil
-    DEBUG_MEMORY = True
+    DEBUG_MEMORY = os.environ.get("ESG_DEBUG_MEMORY", "false").lower() == "true"
+    if DEBUG_MEMORY:
+        print(f"[MEMORY] Profiling enabled (DEBUG_MEMORY={DEBUG_MEMORY})")
 except Exception:
     psutil = None
     DEBUG_MEMORY = False
@@ -23,14 +26,24 @@ from sklearn.cluster import KMeans
 DEBUG = True
 
 # Memory profiling
-def log_memory(stage: str) -> None:
-    """Log current memory usage at a specific stage."""
+def log_memory(stage: str, extra_info: dict = None) -> None:
+    """Log current memory usage at a specific stage with detailed metrics."""
     if DEBUG_MEMORY and psutil:
         process = psutil.Process(os.getpid())
         mem_mb = process.memory_info().rss / 1024 / 1024
-        print(f"[MEMORY] {stage}: {mem_mb:.1f} MB")
+        output = f"[MEMORY] {stage}: {mem_mb:.1f} MB"
+        if extra_info:
+            info_str = ", ".join(f"{k}={v}" for k, v in extra_info.items())
+            output += f" ({info_str})"
+        print(output)
 
 CONFIG = {
+    # Chunking configuration for memory optimization
+    "CHUNK_SIZE_SENTENCES": 200,  # Process 200 sentences per chunk
+    "EMBED_BATCH_SIZE": 32,  # Batch size for embedding generation
+    "ENABLE_CHUNKED_PROCESSING": True,  # Enable chunked processing for large documents
+    "CHUNKING_THRESHOLD": 300,  # Only chunk if document has more than this many sentences
+    
     "MAX_HITS_PER_CATEGORY": 3,
     "RANDOM_STATE": 42,
     "MIN_VALID_SENTENCE_LENGTH": 10,
@@ -118,6 +131,12 @@ MIN_VALID_SENTENCE_LENGTH = CONFIG["MIN_VALID_SENTENCE_LENGTH"]
 LONG_SENTENCE_SPLIT_THRESHOLD = CONFIG["LONG_SENTENCE_SPLIT_THRESHOLD"]
 DEFAULT_NEUTRAL_LABEL = "NEUTRAL"
 VALID_LABELS = ["CLAIM", "OUTCOME", "TARGET", "TRANSPARENCY", "NEUTRAL"]
+
+# Memory optimization configuration
+CHUNK_SIZE_SENTENCES = CONFIG["CHUNK_SIZE_SENTENCES"]
+EMBED_BATCH_SIZE = CONFIG["EMBED_BATCH_SIZE"]
+ENABLE_CHUNKED_PROCESSING = CONFIG["ENABLE_CHUNKED_PROCESSING"]
+CHUNKING_THRESHOLD = CONFIG["CHUNKING_THRESHOLD"]
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_FILENAME = "model_copy.pkl"
@@ -314,7 +333,37 @@ def load_ml_model() -> Tuple[Optional[Any], List[str]]:
     return None, []
 
 
-ml_model, model_classes = load_ml_model()
+# Lazy-load ML model (loaded on first use instead of import time)
+_ml_model: Optional[Any] = None
+_ml_model_classes: List[str] = []
+_ml_model_loaded = False
+_ml_model_failed = False
+
+
+def get_ml_model() -> Tuple[Optional[Any], List[str]]:
+    """Lazy-load the ML model so import-time startup stays lightweight."""
+    global _ml_model, _ml_model_classes, _ml_model_loaded, _ml_model_failed
+    if _ml_model_failed:
+        return None, []
+    if not _ml_model_loaded:
+        _ml_model, _ml_model_classes = load_ml_model()
+        _ml_model_loaded = True
+        if _ml_model is None:
+            _ml_model_failed = True
+    return _ml_model, _ml_model_classes
+
+
+# Backward compatibility: expose ml_model and model_classes
+# These are now loaded lazily on first access via __getattr__
+def __getattr__(name):
+    """Provide lazy access to ml_model and model_classes for backward compatibility."""
+    if name == "ml_model":
+        model, _ = get_ml_model()
+        return model
+    elif name == "model_classes":
+        _, classes = get_ml_model()
+        return classes
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
 # ------------------------------
@@ -349,13 +398,13 @@ def predict_sentence(sentence: str) -> Dict[str, Any]:
     Returns {"label": str, "confidence": float, "probabilities": dict}
     Labels: CLAIM, OUTCOME, TARGET, TRANSPARENCY, NEUTRAL
     """
+    ml_model, _ = get_ml_model()
     if ml_model is None:
         return {
             "label": DEFAULT_NEUTRAL_LABEL,
             "confidence": 0.0,
             "probabilities": _default_probabilities(),
         }
-
     probabilities = {label: 0.0 for label in VALID_LABELS}
 
     try:
@@ -468,15 +517,31 @@ def build_sentence_objects(text: str) -> List[Dict[str, Any]]:
     """
     try:
         raw_sentences = split_sentences(text)
+        log_memory("After sentence splitting", {"raw_sentences": len(raw_sentences), "text_length": len(text)})
+        
         sentences, embeddings = deduplicate_sentences_with_embeddings(
             raw_sentences,
             threshold=SENTENCE_OBJECT_DEDUPLICATION_THRESHOLD,
         )
+        log_memory("After deduplication", {
+            "sentences": len(sentences),
+            "raw_sentences": len(raw_sentences),
+            "deduplicated": len(raw_sentences) - len(sentences)
+        })
+        
         if not sentences:
             return []
 
         if len(embeddings) != len(sentences):
             embeddings = zero_embedding_matrix(len(sentences))
+
+        # Calculate embedding matrix size
+        embedding_size = embeddings.nbytes if hasattr(embeddings, 'nbytes') else 0
+        log_memory("Before building sentence objects", {
+            "sentences": len(sentences),
+            "embedding_matrix_mb": embedding_size / 1024 / 1024,
+            "embedding_shape": embeddings.shape if hasattr(embeddings, 'shape') else "unknown"
+        })
 
         sentence_objects: List[Dict[str, Any]] = []
         total_entities_extracted = 0
@@ -747,6 +812,8 @@ def link_targets_to_outcomes(
     sentence_objects: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     try:
+        log_memory("Link targets to outcomes - start", {"sentence_objects": len(sentence_objects)})
+        
         TOPIC_MAP = {
             "emissions": "carbon",
             "scope_1": "carbon",
@@ -1001,6 +1068,10 @@ def link_targets_to_outcomes(
             target["best_semantic_similarity"] = top_candidates[0]["semantic_sim"]
             target["best_overall_match"] = top_candidates[0]["overall_match"]
 
+        log_memory("Link targets to outcomes - complete", {
+            "sentence_objects": len(sentence_objects),
+            "targets_linked": sum(1 for obj in sentence_objects if obj.get("label") == "TARGET" and obj.get("linked_outcomes"))
+        })
         return sentence_objects
     except Exception as error:
         print(f"Error linking targets to outcomes: {error}")
@@ -1017,6 +1088,8 @@ def cluster_targets(sentence_objects: List[Dict[str, Any]]) -> List[Dict[str, An
             for sentence in sentence_objects
             if sentence.get("label") == "TARGET"
         ]
+        log_memory("Cluster targets - filtered", {"total_objs": len(sentence_objects), "targets": len(targets)})
+        
         if not targets:
             return []
         if len(targets) < MIN_TARGETS_FOR_KMEANS:
@@ -1027,6 +1100,8 @@ def cluster_targets(sentence_objects: List[Dict[str, Any]]) -> List[Dict[str, An
             for target in targets
             if normalize_embedding(target.get("embedding")) is not None
         ]
+        log_memory("Cluster targets - valid targets", {"valid_targets": len(valid_targets), "invalid": len(targets) - len(valid_targets)})
+        
         if len(valid_targets) < MIN_TARGETS_FOR_KMEANS:
             return [{"targets": [target.get("text", "") for target in targets]}]
 
@@ -1034,15 +1109,22 @@ def cluster_targets(sentence_objects: List[Dict[str, Any]]) -> List[Dict[str, An
         target_embeddings = np.array(
             [normalize_embedding(target.get("embedding")) for target in valid_targets]
         )
+        log_memory("Cluster targets - before KMeans", {
+            "target_embeddings_shape": target_embeddings.shape,
+            "target_embeddings_mb": target_embeddings.nbytes / 1024 / 1024
+        })
+        
         n_clusters = min(MAX_TARGET_CLUSTERS, len(valid_targets))
         kmeans = KMeans(
             n_clusters=n_clusters, random_state=RANDOM_STATE, n_init=KMEANS_N_INIT
         )
         cluster_labels = kmeans.fit_predict(target_embeddings)
+        log_memory("Cluster targets - after KMeans")
         
         # Delete embedding matrix immediately after use
         del target_embeddings
         gc.collect()
+        log_memory("Cluster targets - after cleanup")
 
         clusters: Dict[int, List[str]] = {}
         for index, cluster_id in enumerate(cluster_labels):
@@ -1071,7 +1153,49 @@ def cluster_targets(sentence_objects: List[Dict[str, Any]]) -> List[Dict[str, An
 # ------------------------------
 # Existing utility functions (kept for backward compatibility)
 # ------------------------------
+def embed_sentences_batched(model, sentences: List[str]) -> np.ndarray:
+    """Generate embeddings in batches to reduce peak memory usage."""
+    all_embeddings = []
+    
+    log_memory("Batch embedding start", {"total_sentences": len(sentences), "batch_size": EMBED_BATCH_SIZE})
+    
+    for i in range(0, len(sentences), EMBED_BATCH_SIZE):
+        batch = sentences[i:i + EMBED_BATCH_SIZE]
+        raw_embeddings = model.encode(
+            batch, normalize_embeddings=True, convert_to_numpy=True
+        )
+        batch_embeddings = np.asarray(raw_embeddings, dtype=np.float32)
+        if batch_embeddings.ndim == 1:
+            batch_embeddings = batch_embeddings.reshape(1, -1)
+        all_embeddings.append(batch_embeddings)
+        
+        log_memory(f"Batch {i // EMBED_BATCH_SIZE + 1}", {
+            "batch_num": i // EMBED_BATCH_SIZE + 1,
+            "batch_size": len(batch),
+            "batch_mb": batch_embeddings.nbytes / 1024 / 1024 if hasattr(batch_embeddings, 'nbytes') else 0
+        })
+        
+        # Explicit cleanup after each batch
+        del batch_embeddings
+        del raw_embeddings
+        if i + EMBED_BATCH_SIZE < len(sentences):
+            gc.collect()
+    
+    # Concatenate all batches
+    result = np.vstack(all_embeddings) if all_embeddings else np.empty((0, CONFIG["EMBEDDING_DIM"]), dtype=np.float32)
+    log_memory("Batch embedding complete", {
+        "final_shape": result.shape if hasattr(result, 'shape') else "unknown",
+        "final_mb": result.nbytes / 1024 / 1024 if hasattr(result, 'nbytes') else 0
+    })
+    
+    # Cleanup
+    del all_embeddings
+    gc.collect()
+    
+    return result
+
 def embed_sentences(sentences: Sequence[str]) -> np.ndarray:
+    """Generate embeddings for sentences with batching for memory efficiency."""
     if not sentences:
         return np.empty((0, CONFIG["EMBEDDING_DIM"]), dtype=np.float32)
 
@@ -1081,8 +1205,16 @@ def embed_sentences(sentences: Sequence[str]) -> np.ndarray:
         return zero_embedding_matrix(len(sentences))
 
     try:
+        # Convert to list once
+        sentences_list = list(sentences)
+        
+        # Use batching for large sentence sets
+        if len(sentences_list) > EMBED_BATCH_SIZE:
+            return embed_sentences_batched(embedding_model, sentences_list)
+        
+        # Process all at once for small sets
         raw_embeddings = embedding_model.encode(
-            list(sentences), normalize_embeddings=True, convert_to_numpy=True
+            sentences_list, normalize_embeddings=True, convert_to_numpy=True
         )
         embeddings = np.asarray(raw_embeddings, dtype=np.float32)
         if embeddings.ndim == 1:
@@ -1164,6 +1296,8 @@ def deduplicate_sentences_with_embeddings(
         return [], np.empty((0, CONFIG["EMBEDDING_DIM"]), dtype=np.float32)
 
     try:
+        log_memory("Before deduplication", {"input_sentences": len(sentences)})
+        
         # Avoid unnecessary copy if already a list
         sentences_list = sentences if isinstance(sentences, list) else list(sentences)
         
@@ -1178,6 +1312,12 @@ def deduplicate_sentences_with_embeddings(
             sentences_list = unique_sentences
 
         embeddings = embed_sentences(sentences_list)
+        log_memory("After embedding generation in dedup", {
+            "sentences": len(sentences_list),
+            "embedding_shape": embeddings.shape if hasattr(embeddings, 'shape') else "unknown",
+            "embedding_mb": embeddings.nbytes / 1024 / 1024 if hasattr(embeddings, 'nbytes') else 0
+        })
+        
         if embeddings.size == 0:
             return sentences_list, zero_embedding_matrix(len(sentences_list))
 
@@ -1200,6 +1340,11 @@ def deduplicate_sentences_with_embeddings(
         # Create final arrays only once
         kept_sentences = [sentences_list[index] for index in keep_indices]
         kept_embeddings = embeddings[keep_indices]
+        log_memory("After deduplication filtering", {
+            "kept_sentences": len(kept_sentences),
+            "original_sentences": len(sentences_list),
+            "removed": len(sentences_list) - len(kept_sentences)
+        })
         return kept_sentences, kept_embeddings
     except Exception as error:
         print(f"Error deduplicating sentences with embeddings: {error}")
@@ -3062,7 +3207,7 @@ def default_analysis_output():
 def analyze_text(text: str, ml_predictions: Optional[dict] = None):
     _ = ml_predictions
 
-    log_memory("Document received")
+    log_memory("Document received", {"text_length": len(text)})
 
     default_output = default_analysis_output()
     stage_timings: Dict[str, float] = {}
@@ -3073,17 +3218,34 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
         stage_timings["build_sentence_objects"] = round(
             time.perf_counter() - stage_start, 4
         )
-        log_memory("After sentence object construction")
+        log_memory("After sentence object construction", {
+            "sentence_objs": len(sentence_objs),
+            "text_length": len(text)
+        })
 
         stage_start = time.perf_counter()
         sentence_objs = link_targets_to_outcomes(sentence_objs)
         stage_timings["link_targets_to_outcomes"] = round(
             time.perf_counter() - stage_start, 4
         )
-        log_memory("After linking")
+        
+        # Calculate embedding matrix size
+        embedding_size = 0
+        for obj in sentence_objs:
+            emb = obj.get("embedding")
+            if emb is not None and hasattr(emb, 'nbytes'):
+                embedding_size += emb.nbytes
+        
+        log_memory("After linking", {
+            "sentence_objs": len(sentence_objs),
+            "embedding_matrix_mb": embedding_size / 1024 / 1024
+        })
 
         # Compute sentence classes from objects (lightweight)
         sentence_classes = sentence_classes_from_objects(sentence_objs)
+        log_memory("After sentence classes", {
+            "sentence_classes": len(sentence_classes)
+        })
 
         stage_start = time.perf_counter()
         consistency = compute_cross_sentence_consistency(sentence_objects=sentence_objs)
@@ -3102,6 +3264,7 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
         stage_timings["compute_claim_pressure"] = round(
             time.perf_counter() - stage_start, 4
         )
+        log_memory("After claim pressure")
 
         stage_start = time.perf_counter()
         outcome = (
@@ -3308,7 +3471,10 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
             "claim_pressure": claim_pressure,
         }
         drivers = generate_drivers(claim, outcome, transparency, metrics)
-        log_memory("Before response serialization")
+        log_memory("Before response serialization", {
+            "sentence_objs": len(sentence_objs),
+            "sentence_classes": len(sentence_classes)
+        })
 
         response = {
             "claim_pressure": claim_pressure,
@@ -3446,4 +3612,6 @@ def analyze_text(text: str, ml_predictions: Optional[dict] = None):
         return response
     except Exception as error:
         print(f"Error analyzing text: {error}")
+        import traceback
+        traceback.print_exc()
         return default_output

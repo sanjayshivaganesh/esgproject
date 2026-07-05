@@ -27,17 +27,29 @@ async function parsePdf(file) {
   const pdf = await pdfjsLib.getDocument({ data }).promise
   const pages = []
 
+  // Process pages sequentially to reduce peak memory
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber)
     const content = await page.getTextContent()
+    
+    // Extract text immediately and release page resources
     const pageText = content.items
       .map((item) => item.str)
       .join(' ')
       .replace(/(\w)-\s+(\w)/g, '$1$2')
 
     pages.push(normalizeText(pageText))
+    
+    // Explicit cleanup of page objects to free memory
+    page.cleanup()
+    content.items = null
   }
 
+  // Clean up PDF document object
+  pdf.destroy()
+  pdf.data = null
+
+  // Join pages at the end (more efficient than repeated concatenation)
   return normalizeText(pages.join('\n\n'))
 }
 

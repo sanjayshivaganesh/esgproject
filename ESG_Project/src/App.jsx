@@ -37,7 +37,7 @@ function App() {
     setIsProcessing(true)
 
     try {
-      const res = await fetch('https://esgbackend-jmrb.onrender.com/analyze', {
+      const res = await fetch('http://127.0.0.1:8000', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
